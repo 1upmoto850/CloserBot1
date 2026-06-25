@@ -20,10 +20,22 @@ CARRIERS = {
     "lga": "Legal & General America",
 }
 
+ADMIN_ROLE_NAMES = {
+    "agency owner",
+    "partner",
+    "managing partner",
+    "senior partner",
+    "executive partner",
+    "regional manager",
+    "district manager",
+    "sales manager",
+    "admin",
+    "administrator",
+}
+
 DB_FILE = "closerbot.db"
 WHALE_THRESHOLD = 1700
 
-# Monthly status ladder
 STATUS_LEVELS = [
     (75000, "👑 God Mode"),
     (60000, "🤴 King"),
@@ -39,6 +51,7 @@ STATUS_LEVELS = [
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 client = discord.Client(intents=intents)
 
 conn = sqlite3.connect(DB_FILE)
@@ -72,11 +85,26 @@ CREATE TABLE IF NOT EXISTS settings (
 )
 """)
 
+cur.execute("""
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id TEXT NOT NULL,
+    admin_name TEXT NOT NULL,
+    action TEXT NOT NULL,
+    details TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)
+""")
+
 conn.commit()
 
 
 def money(amount):
     return f"${amount:,.2f}"
+
+
+def now_iso():
+    return datetime.now().isoformat()
 
 
 def get_start(period):
@@ -95,13 +123,54 @@ def get_start(period):
     return now
 
 
+def is_admin(member):
+    if member.guild_permissions.administrator:
+        return True
+
+    role_names = {role.name.lower() for role in member.roles}
+
+    return bool(role_names.intersection(ADMIN_ROLE_NAMES))
+
+
+def require_admin_message():
+    return "❌ Admin only. You need a manager or admin role to use this command."
+
+
+def audit(admin, action, details):
+    cur.execute("""
+    INSERT INTO audit_log (admin_id, admin_name, action, details, created_at)
+    VALUES (?, ?, ?, ?, ?)
+    """, (str(admin.id), admin.display_name, action, details, now_iso()))
+    conn.commit()
+
+
 def add_ap(user_id, username, amount, carrier):
     cur.execute("""
     INSERT INTO ap_entries (user_id, username, amount, carrier, created_at)
     VALUES (?, ?, ?, ?, ?)
-    """, (str(user_id), username, amount, carrier, datetime.now().isoformat()))
+    """, (str(user_id), username, amount, carrier, now_iso()))
     conn.commit()
     return cur.lastrowid
+
+
+def get_entry(entry_id):
+    cur.execute("SELECT * FROM ap_entries WHERE id = ?", (entry_id,))
+    return cur.fetchone()
+
+
+def edit_entry_amount(entry_id, new_amount):
+    cur.execute("UPDATE ap_entries SET amount = ? WHERE id = ?", (new_amount, entry_id))
+    conn.commit()
+
+
+def edit_entry_carrier(entry_id, new_carrier):
+    cur.execute("UPDATE ap_entries SET carrier = ? WHERE id = ?", (new_carrier, entry_id))
+    conn.commit()
+
+
+def delete_entry(entry_id):
+    cur.execute("DELETE FROM ap_entries WHERE id = ?", (entry_id,))
+    conn.commit()
 
 
 def set_goal(user_id, period, amount):
@@ -171,6 +240,25 @@ def rank_for_user(user_id, period):
             return index
 
     return None
+
+
+def user_history(user_id, limit=10):
+    cur.execute("""
+    SELECT * FROM ap_entries
+    WHERE user_id = ?
+    ORDER BY id DESC
+    LIMIT ?
+    """, (str(user_id), limit))
+    return cur.fetchall()
+
+
+def recent_entries(limit=10):
+    cur.execute("""
+    SELECT * FROM ap_entries
+    ORDER BY id DESC
+    LIMIT ?
+    """, (limit,))
+    return cur.fetchall()
 
 
 def leaderboard_snapshot(period="week", limit=10):
@@ -252,11 +340,11 @@ def get_setting(key):
     return row["value"] if row else None
 
 
-def make_embed(title, description=None):
+def make_embed(title, description=None, color=0x2ECC71):
     return discord.Embed(
         title=title,
         description=description,
-        color=0x2ECC71,
+        color=color,
         timestamp=datetime.now()
     )
 
@@ -432,10 +520,18 @@ async def send_whale_alert(message, amount, carrier_code, week_total):
     await message.channel.send(embed=whale)
 
 
+def format_entry(entry):
+    created = entry["created_at"].split("T")[0]
+    return (
+        f"**#{entry['id']}** | **{entry['username']}** | "
+        f"{money(entry['amount'])} | {CARRIERS.get(entry['carrier'], entry['carrier'])} | {created}"
+    )
+
+
 @client.event
 async def on_ready():
     print("====================================")
-    print("        CLOSERBOT v1.1")
+    print("        CLOSERBOT v1.2 ADMIN")
     print("====================================")
     print(f"✅ Logged in as {client.user}")
     print("Ready to Track Closers 🚀")
@@ -450,6 +546,10 @@ async def on_message(message):
     content = raw.lower()
 
     if content == "setupscoreboard":
+        if not is_admin(message.author):
+            await message.channel.send(require_admin_message())
+            return
+
         embed = scoreboard_embed()
         msg = await message.channel.send(embed=embed)
 
@@ -493,8 +593,6 @@ async def on_message(message):
 
         week_rank = rank_for_user(message.author.id, "week")
         month_rank = rank_for_user(message.author.id, "month")
-
-        _, status = current_status(month_total)
 
         embed = make_embed("✅ AP RECORDED")
         embed.add_field(name="Rep", value=message.author.display_name, inline=True)
@@ -549,6 +647,210 @@ async def on_message(message):
 
         await message.channel.send(embed=embed)
         await update_scoreboard()
+        return
+
+    # Admin: add AP for someone else.
+    addap_match = re.match(r"^addap\s+<@!?(\d+)>\s+\$?([\d,]+(?:\.\d{1,2})?)\s+([a-z]+)$", content)
+    if addap_match:
+        if not is_admin(message.author):
+            await message.channel.send(require_admin_message())
+            return
+
+        user_id = addap_match.group(1)
+        amount = float(addap_match.group(2).replace(",", ""))
+        carrier_code = addap_match.group(3)
+
+        if carrier_code not in CARRIERS:
+            await message.channel.send("❌ Invalid carrier.")
+            return
+
+        member = message.guild.get_member(int(user_id))
+        username = member.display_name if member else f"User {user_id}"
+
+        entry_id = add_ap(user_id, username, amount, carrier_code)
+        audit(message.author, "ADDAP", f"Added {money(amount)} {carrier_code} for {username}, entry #{entry_id}")
+
+        await update_scoreboard()
+
+        embed = make_embed("✅ ADMIN AP ADDED")
+        embed.description = f"Entry **#{entry_id}** added for **{username}**: {money(amount)} with {CARRIERS[carrier_code]}"
+        await message.channel.send(embed=embed)
+        return
+
+    # Admin: edit AP amount.
+    editap_match = re.match(r"^editap\s+(\d+)\s+\$?([\d,]+(?:\.\d{1,2})?)$", content)
+    if editap_match:
+        if not is_admin(message.author):
+            await message.channel.send(require_admin_message())
+            return
+
+        entry_id = int(editap_match.group(1))
+        new_amount = float(editap_match.group(2).replace(",", ""))
+        entry = get_entry(entry_id)
+
+        if not entry:
+            await message.channel.send(f"❌ Entry #{entry_id} not found.")
+            return
+
+        old_amount = entry["amount"]
+        edit_entry_amount(entry_id, new_amount)
+        audit(message.author, "EDITAP", f"Entry #{entry_id}: {money(old_amount)} -> {money(new_amount)}")
+
+        await update_scoreboard()
+
+        embed = make_embed("✏️ AP EDITED")
+        embed.description = (
+            f"Entry **#{entry_id}** updated.\n\n"
+            f"Rep: **{entry['username']}**\n"
+            f"Old AP: **{money(old_amount)}**\n"
+            f"New AP: **{money(new_amount)}**"
+        )
+        await message.channel.send(embed=embed)
+        return
+
+    # Admin: edit carrier.
+    editcarrier_match = re.match(r"^editcarrier\s+(\d+)\s+([a-z]+)$", content)
+    if editcarrier_match:
+        if not is_admin(message.author):
+            await message.channel.send(require_admin_message())
+            return
+
+        entry_id = int(editcarrier_match.group(1))
+        new_carrier = editcarrier_match.group(2)
+        entry = get_entry(entry_id)
+
+        if not entry:
+            await message.channel.send(f"❌ Entry #{entry_id} not found.")
+            return
+
+        if new_carrier not in CARRIERS:
+            await message.channel.send("❌ Invalid carrier.")
+            return
+
+        old_carrier = entry["carrier"]
+        edit_entry_carrier(entry_id, new_carrier)
+        audit(message.author, "EDITCARRIER", f"Entry #{entry_id}: {old_carrier} -> {new_carrier}")
+
+        await update_scoreboard()
+
+        embed = make_embed("✏️ CARRIER EDITED")
+        embed.description = (
+            f"Entry **#{entry_id}** updated.\n\n"
+            f"Rep: **{entry['username']}**\n"
+            f"Old Carrier: **{CARRIERS.get(old_carrier, old_carrier)}**\n"
+            f"New Carrier: **{CARRIERS[new_carrier]}**"
+        )
+        await message.channel.send(embed=embed)
+        return
+
+    # Admin: delete entry.
+    deleteap_match = re.match(r"^deleteap\s+(\d+)$", content)
+    if deleteap_match:
+        if not is_admin(message.author):
+            await message.channel.send(require_admin_message())
+            return
+
+        entry_id = int(deleteap_match.group(1))
+        entry = get_entry(entry_id)
+
+        if not entry:
+            await message.channel.send(f"❌ Entry #{entry_id} not found.")
+            return
+
+        delete_entry(entry_id)
+        audit(message.author, "DELETEAP", f"Deleted entry #{entry_id}: {entry['username']} {money(entry['amount'])} {entry['carrier']}")
+
+        await update_scoreboard()
+
+        embed = make_embed("🗑 AP DELETED", color=0xE74C3C)
+        embed.description = (
+            f"Deleted Entry **#{entry_id}**.\n\n"
+            f"Rep: **{entry['username']}**\n"
+            f"AP: **{money(entry['amount'])}**\n"
+            f"Carrier: **{CARRIERS.get(entry['carrier'], entry['carrier'])}**"
+        )
+        await message.channel.send(embed=embed)
+        return
+
+    # Admin: recent entries.
+    if content in {"entries", "recent"}:
+        if not is_admin(message.author):
+            await message.channel.send(require_admin_message())
+            return
+
+        rows = recent_entries(15)
+        embed = make_embed("📋 Recent AP Entries")
+
+        if not rows:
+            embed.description = "No entries yet."
+        else:
+            embed.description = "\n".join(format_entry(row) for row in rows)
+
+        await message.channel.send(embed=embed)
+        return
+
+    # Admin: user history by mention.
+    history_match = re.match(r"^history\s+<@!?(\d+)>$", content)
+    if history_match:
+        if not is_admin(message.author):
+            await message.channel.send(require_admin_message())
+            return
+
+        user_id = history_match.group(1)
+        rows = user_history(user_id, 15)
+        member = message.guild.get_member(int(user_id))
+        username = member.display_name if member else f"User {user_id}"
+
+        embed = make_embed(f"📋 AP History: {username}")
+
+        if not rows:
+            embed.description = "No entries found."
+        else:
+            embed.description = "\n".join(format_entry(row) for row in rows)
+
+        await message.channel.send(embed=embed)
+        return
+
+    # Admin: audit log.
+    if content == "audit":
+        if not is_admin(message.author):
+            await message.channel.send(require_admin_message())
+            return
+
+        cur.execute("""
+        SELECT * FROM audit_log
+        ORDER BY id DESC
+        LIMIT 10
+        """)
+        rows = cur.fetchall()
+
+        embed = make_embed("🧾 Admin Audit Log")
+
+        if not rows:
+            embed.description = "No admin actions yet."
+        else:
+            text = ""
+            for row in rows:
+                created = row["created_at"].split("T")[0]
+                text += f"**#{row['id']}** {created} | **{row['admin_name']}** | {row['action']}\n{row['details']}\n\n"
+            embed.description = text[:3900]
+
+        await message.channel.send(embed=embed)
+        return
+
+    if content == "adminhelp":
+        await message.channel.send(
+            "**CloserBot Admin Commands**\n\n"
+            "`entries` or `recent` - show last 15 AP entries\n"
+            "`history @rep` - show a rep's recent AP entries\n"
+            "`addap @rep 1800 americo` - add AP for a rep\n"
+            "`editap 42 1500` - edit entry #42 amount\n"
+            "`editcarrier 42 moo` - edit entry #42 carrier\n"
+            "`deleteap 42` - delete entry #42\n"
+            "`audit` - show admin changes\n"
+            "`refresh` - refresh live scoreboard\n\n"
+            "Admin access is based on Discord roles: Sales Manager, District Manager, Regional Manager, Agency Owner, Partner, Managing Partner, Senior Partner, Executive Partner, Admin."
+        )
         return
 
     if content == "stats":
@@ -613,6 +915,10 @@ async def on_message(message):
         return
 
     if content == "refresh":
+        if not is_admin(message.author):
+            await message.channel.send(require_admin_message())
+            return
+
         await update_scoreboard()
         await message.channel.send("✅ Scoreboard refreshed.")
         return
@@ -628,8 +934,8 @@ async def on_message(message):
             "`daily`\n"
             "`weekly`\n"
             "`monthly`\n"
-            "`setupscoreboard`\n"
-            "`refresh`\n\n"
+            "`help`\n\n"
+            "**Admin:** `adminhelp`\n\n"
             "Carriers: `amam, sbli, ahl, americo, moo, nlg, trans, uhl, lga`"
         )
 
