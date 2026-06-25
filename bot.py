@@ -96,6 +96,17 @@ CREATE TABLE IF NOT EXISTS audit_log (
 )
 """)
 
+cur.execute("""
+CREATE TABLE IF NOT EXISTS ap_overrides (
+    user_id TEXT NOT NULL,
+    username TEXT NOT NULL,
+    period TEXT NOT NULL,
+    amount REAL NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, period)
+)
+""")
+
 conn.commit()
 
 
@@ -173,6 +184,31 @@ def delete_entry(entry_id):
     conn.commit()
 
 
+def set_override(user_id, username, period, amount):
+    cur.execute("""
+    INSERT OR REPLACE INTO ap_overrides (user_id, username, period, amount, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    """, (str(user_id), username, period, amount, now_iso()))
+    conn.commit()
+
+
+def get_override(user_id, period):
+    cur.execute("""
+    SELECT amount FROM ap_overrides
+    WHERE user_id = ? AND period = ?
+    """, (str(user_id), period))
+    row = cur.fetchone()
+    return row["amount"] if row else None
+
+
+def delete_override(user_id, period):
+    cur.execute("""
+    DELETE FROM ap_overrides
+    WHERE user_id = ? AND period = ?
+    """, (str(user_id), period))
+    conn.commit()
+
+
 def set_goal(user_id, period, amount):
     cur.execute("""
     INSERT OR REPLACE INTO goals (user_id, period, amount)
@@ -190,7 +226,7 @@ def get_goal(user_id, period):
     return row["amount"] if row else 0
 
 
-def user_total(user_id, period):
+def raw_user_total(user_id, period):
     start = get_start(period)
     cur.execute("""
     SELECT COALESCE(SUM(amount), 0) total
@@ -200,7 +236,33 @@ def user_total(user_id, period):
     return cur.fetchone()["total"]
 
 
+def user_total(user_id, period):
+    override = get_override(user_id, period)
+    if override is not None:
+        return override
+
+    return raw_user_total(user_id, period)
+
+
 def team_total(period):
+    if period in {"week", "month"}:
+        user_ids = set()
+
+        start = get_start(period)
+        cur.execute("""
+        SELECT DISTINCT user_id FROM ap_entries
+        WHERE created_at >= ?
+        """, (start.isoformat(),))
+        user_ids.update(row["user_id"] for row in cur.fetchall())
+
+        cur.execute("""
+        SELECT DISTINCT user_id FROM ap_overrides
+        WHERE period = ?
+        """, (period,))
+        user_ids.update(row["user_id"] for row in cur.fetchall())
+
+        return sum(user_total(user_id, period) for user_id in user_ids)
+
     start = get_start(period)
     cur.execute("""
     SELECT COALESCE(SUM(amount), 0) total
@@ -211,6 +273,40 @@ def team_total(period):
 
 
 def leaderboard(period, limit=10):
+    if period in {"week", "month"}:
+        users = {}
+
+        start = get_start(period)
+        cur.execute("""
+        SELECT user_id, username, SUM(amount) total
+        FROM ap_entries
+        WHERE created_at >= ?
+        GROUP BY user_id
+        """, (start.isoformat(),))
+
+        for row in cur.fetchall():
+            users[row["user_id"]] = {
+                "user_id": row["user_id"],
+                "username": row["username"],
+                "total": row["total"] or 0,
+            }
+
+        cur.execute("""
+        SELECT user_id, username, amount
+        FROM ap_overrides
+        WHERE period = ?
+        """, (period,))
+
+        for row in cur.fetchall():
+            users[row["user_id"]] = {
+                "user_id": row["user_id"],
+                "username": row["username"],
+                "total": row["amount"] or 0,
+            }
+
+        sorted_rows = sorted(users.values(), key=lambda item: item["total"], reverse=True)[:limit]
+        return sorted_rows
+
     start = get_start(period)
     cur.execute("""
     SELECT user_id, username, SUM(amount) total
@@ -224,16 +320,7 @@ def leaderboard(period, limit=10):
 
 
 def rank_for_user(user_id, period):
-    start = get_start(period)
-    cur.execute("""
-    SELECT user_id, SUM(amount) total
-    FROM ap_entries
-    WHERE created_at >= ?
-    GROUP BY user_id
-    ORDER BY total DESC
-    """, (start.isoformat(),))
-
-    rows = cur.fetchall()
+    rows = leaderboard(period, 10000)
 
     for index, row in enumerate(rows, start=1):
         if row["user_id"] == str(user_id):
@@ -531,7 +618,7 @@ def format_entry(entry):
 @client.event
 async def on_ready():
     print("====================================")
-    print("        CLOSERBOT v1.2 ADMIN")
+    print("        CLOSERBOT v1.3 ADMIN OVERRIDES")
     print("====================================")
     print(f"✅ Logged in as {client.user}")
     print("Ready to Track Closers 🚀")
@@ -647,6 +734,115 @@ async def on_message(message):
 
         await message.channel.send(embed=embed)
         await update_scoreboard()
+        return
+
+
+    # Admin: manually set a rep's weekly or monthly AP.
+    set_period_match = re.match(r"^set(week|month)(?:\s+<@!?(\d+)>)?\s+\$?([\d,]+(?:\.\d{1,2})?)$", content)
+    if set_period_match:
+        if not is_admin(message.author):
+            await message.channel.send(require_admin_message())
+            return
+
+        period = set_period_match.group(1)
+        mentioned_user_id = set_period_match.group(2)
+        amount = float(set_period_match.group(3).replace(",", ""))
+
+        if mentioned_user_id:
+            target_id = mentioned_user_id
+            member = message.guild.get_member(int(target_id))
+            username = member.display_name if member else f"User {target_id}"
+        else:
+            target_id = str(message.author.id)
+            username = message.author.display_name
+
+        old_total = user_total(target_id, period)
+        set_override(target_id, username, period, amount)
+        audit(message.author, f"SET{period.upper()}", f"{username}: {money(old_total)} -> {money(amount)}")
+
+        await update_scoreboard()
+
+        embed = make_embed(f"✅ {period.title()} AP Set")
+        embed.description = (
+            f"Rep: **{username}**\n"
+            f"Old {period.title()} AP: **{money(old_total)}**\n"
+            f"New {period.title()} AP: **{money(amount)}**"
+        )
+        await message.channel.send(embed=embed)
+        return
+
+    # Admin: adjust a rep's weekly or monthly AP up or down.
+    adjust_period_match = re.match(r"^adjust(week|month)(?:\s+<@!?(\d+)>)?\s+([+-]?\$?[\d,]+(?:\.\d{1,2})?)$", content)
+    if adjust_period_match:
+        if not is_admin(message.author):
+            await message.channel.send(require_admin_message())
+            return
+
+        period = adjust_period_match.group(1)
+        mentioned_user_id = adjust_period_match.group(2)
+        raw_amount = adjust_period_match.group(3).replace("$", "").replace(",", "")
+        adjustment = float(raw_amount)
+
+        if mentioned_user_id:
+            target_id = mentioned_user_id
+            member = message.guild.get_member(int(target_id))
+            username = member.display_name if member else f"User {target_id}"
+        else:
+            target_id = str(message.author.id)
+            username = message.author.display_name
+
+        old_total = user_total(target_id, period)
+        new_total = old_total + adjustment
+        if new_total < 0:
+            new_total = 0
+
+        set_override(target_id, username, period, new_total)
+        audit(message.author, f"ADJUST{period.upper()}", f"{username}: {money(old_total)} -> {money(new_total)} ({adjustment:+,.2f})")
+
+        await update_scoreboard()
+
+        embed = make_embed(f"✅ {period.title()} AP Adjusted")
+        embed.description = (
+            f"Rep: **{username}**\n"
+            f"Adjustment: **{adjustment:+,.2f}**\n"
+            f"Old {period.title()} AP: **{money(old_total)}**\n"
+            f"New {period.title()} AP: **{money(new_total)}**"
+        )
+        await message.channel.send(embed=embed)
+        return
+
+    # Admin: remove manual weekly or monthly AP override.
+    clear_period_match = re.match(r"^clear(week|month)(?:\s+<@!?(\d+)>)?$", content)
+    if clear_period_match:
+        if not is_admin(message.author):
+            await message.channel.send(require_admin_message())
+            return
+
+        period = clear_period_match.group(1)
+        mentioned_user_id = clear_period_match.group(2)
+
+        if mentioned_user_id:
+            target_id = mentioned_user_id
+            member = message.guild.get_member(int(target_id))
+            username = member.display_name if member else f"User {target_id}"
+        else:
+            target_id = str(message.author.id)
+            username = message.author.display_name
+
+        old_total = user_total(target_id, period)
+        delete_override(target_id, period)
+        new_total = user_total(target_id, period)
+        audit(message.author, f"CLEAR{period.upper()}", f"{username}: cleared override, {money(old_total)} -> {money(new_total)}")
+
+        await update_scoreboard()
+
+        embed = make_embed(f"✅ {period.title()} Override Cleared")
+        embed.description = (
+            f"Rep: **{username}**\n"
+            f"Old {period.title()} AP: **{money(old_total)}**\n"
+            f"Now Calculated From Entries: **{money(new_total)}**"
+        )
+        await message.channel.send(embed=embed)
         return
 
     # Admin: add AP for someone else.
@@ -847,6 +1043,14 @@ async def on_message(message):
             "`editap 42 1500` - edit entry #42 amount\n"
             "`editcarrier 42 moo` - edit entry #42 carrier\n"
             "`deleteap 42` - delete entry #42\n"
+            "`setweek 25000` - set your weekly AP\n"
+            "`setweek @rep 25000` - set a rep's weekly AP\n"
+            "`setmonth 64000` - set your monthly AP\n"
+            "`setmonth @rep 64000` - set a rep's monthly AP\n"
+            "`adjustweek @rep +1800` - add/subtract weekly AP\n"
+            "`adjustmonth @rep -500` - add/subtract monthly AP\n"
+            "`clearweek @rep` - remove weekly override\n"
+            "`clearmonth @rep` - remove monthly override\n"
             "`audit` - show admin changes\n"
             "`refresh` - refresh live scoreboard\n\n"
             "Admin access is based on Discord roles: Sales Manager, District Manager, Regional Manager, Agency Owner, Partner, Managing Partner, Senior Partner, Executive Partner, Admin."
