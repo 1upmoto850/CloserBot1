@@ -192,12 +192,16 @@ def set_override(user_id, username, period, amount):
     conn.commit()
 
 
-def get_override(user_id, period):
+def get_override_row(user_id, period):
     cur.execute("""
-    SELECT amount FROM ap_overrides
+    SELECT amount, updated_at FROM ap_overrides
     WHERE user_id = ? AND period = ?
     """, (str(user_id), period))
-    row = cur.fetchone()
+    return cur.fetchone()
+
+
+def get_override(user_id, period):
+    row = get_override_row(user_id, period)
     return row["amount"] if row else None
 
 
@@ -237,9 +241,17 @@ def raw_user_total(user_id, period):
 
 
 def user_total(user_id, period):
-    override = get_override(user_id, period)
+    override = get_override_row(user_id, period)
     if override is not None:
-        return override
+        # Manual set/adjust commands create a baseline, not a frozen total.
+        # Any AP submitted after the manual change still counts on top of it.
+        cur.execute("""
+        SELECT COALESCE(SUM(amount), 0) total
+        FROM ap_entries
+        WHERE user_id = ? AND created_at > ?
+        """, (str(user_id), override["updated_at"]))
+        post_override_total = cur.fetchone()["total"]
+        return override["amount"] + post_override_total
 
     return raw_user_total(user_id, period)
 
@@ -301,7 +313,7 @@ def leaderboard(period, limit=10):
             users[row["user_id"]] = {
                 "user_id": row["user_id"],
                 "username": row["username"],
-                "total": row["amount"] or 0,
+                "total": user_total(row["user_id"], period),
             }
 
         sorted_rows = sorted(users.values(), key=lambda item: item["total"], reverse=True)[:limit]
