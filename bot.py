@@ -938,18 +938,12 @@ async def on_ready():
         scheduler.start()
 
 
-@client.event
-async def on_message(message):
-    if message.author.bot:
+async def process_line(message, raw_line, guild_id, out):
+    """Process a single line of a message as a potential bot command or AP entry."""
+    raw = raw_line.strip()
+    if not raw:
         return
-
-    if message.guild is None:
-        return  # Ignore DMs
-
-    guild_id = str(message.guild.id)
-    raw = message.content.strip()
     content = raw.lower()
-    out = get_output_channel(guild_id, message.channel)
 
     if content == "setupscoreboard":
         if not is_admin(message.author):
@@ -1828,6 +1822,23 @@ async def on_message(message):
         )
         await out.send(embed=err)
 
+
+
+@client.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    if message.guild is None:
+        return  # Ignore DMs
+
+    guild_id = str(message.guild.id)
+    out = get_output_channel(guild_id, message.channel)
+
+    # Split on newlines so reps can type multiple entries in one message
+    lines = message.content.split("\n")
+    for line in lines:
+        await process_line(message, line, guild_id, out)
 
 
 @client.event
