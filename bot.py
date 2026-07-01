@@ -1076,11 +1076,20 @@ async def process_line(message, raw_line, guild_id, out):
 
     ap_match = re.match(r"^ap\s+\$?([\d,]+(?:\.\d{1,2})?)\s+([a-z]+)$", content)
 
-    # Determine if this message looks like an AP attempt at all
+    amount_match = re.search(r"\$?[\d,]+(?:\.\d{1,2})?", content)
+    has_amount = amount_match is not None
+    words = [word.lower().strip("$.,") for word in re.split(r"[\s|]+", content)]
+    has_known_carrier = any(word in CARRIERS for word in words)
+    starts_with_ap = re.match(r"^ap(?:\s|$)", content) is not None
+    contains_ap = re.search(r"\bap\b", content) is not None
+
+    # Only treat chat as AP when it clearly looks like an AP entry. This avoids
+    # noisy alerts for normal messages that happen to mention "AP" or money.
     looks_like_ap = (
         ap_match is not None
-        or re.search(r"\bap\b", content) is not None
-        or re.search(r"\$[\d,]+", content) is not None
+        or starts_with_ap
+        or (contains_ap and has_amount)
+        or (has_amount and has_known_carrier)
     )
 
     if looks_like_ap:
@@ -1103,8 +1112,15 @@ async def process_line(message, raw_line, guild_id, out):
                 "I found something that looked like an AP entry but couldn't read the amount or carrier.\n\n"
                 "**Format:** `ap [amount] [carrier]`\n"
                 "**Example:** `ap 1209 americo`\n\n"
-                "**Carrier codes:** `amam` `sbli` `ahl` `americo` `moo` `nlg` `trans` `uhl` `lga`"
+                "**Carrier codes:** `amam` `sbli` `ahl` `americo` `moo` `nlg` `trans` `uhl` `lga` `lb`"
             )
+            await out.send(embed=err)
+            return
+
+        amount, carrier_code = parsed
+        if carrier_code not in CARRIERS:
+            err = make_embed("❌ Unknown Carrier", color=C_RED)
+            err.description = "Valid codes: `amam` `sbli` `ahl` `americo` `moo` `nlg` `trans` `uhl` `lga` `lb`"
             await out.send(embed=err)
             return
 
@@ -1798,29 +1814,9 @@ async def process_line(message, raw_line, guild_id, out):
         await out.send(embed=embed)
         return
 
-    # Unknown command catch — only fires if the message looks like a bot command attempt
-    known_prefixes = ("ap ", "goal ", "addap ", "editap ", "editcarrier ",
-                      "deleteap ", "setweek", "setmonth", "adjustweek",
-                      "adjustmonth", "clearweek", "clearmonth", "history ")
-    single_commands = {"stats", "levels", "daily", "weekly", "monthly",
-                       "help", "adminhelp", "entries", "recent", "audit",
-                       "refresh", "setupscoreboard", "setupoutput", "setupannouncements", "resetalldata", "alltime", "pastweek", "pastmonth"}
-
-    is_command_attempt = (
-        content in single_commands
-        or any(content.startswith(p) for p in known_prefixes)
-        # Short single words that look like mistyped commands
-        or (len(content.split()) == 1 and len(content) <= 15 and content.isalpha())
-    )
-
-    if is_command_attempt and content not in single_commands:
-        err = make_embed("❓ Command Not Recognized", color=C_NAVY)
-        err.description = (
-            "That command didn't match anything.\n\n"
-            "Type `help` to see all available commands.\n"
-            "Type `adminhelp` if you're a manager."
-        )
-        await out.send(embed=err)
+    # Ignore anything that was not recognized above. This keeps normal channel
+    # chatter and mistyped commands from creating noisy public alerts.
+    return
 
 
 
