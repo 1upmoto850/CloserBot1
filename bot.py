@@ -62,11 +62,164 @@ def resolve_carrier(word):
 
 def carrier_mentioned(text):
     """Quick detection: does any word map to a known carrier (exact/alias only)?"""
-    for word in re.split(r"[\s|]+", text):
+    for word in re.split(r"[\s|/]+", text):
         w = re.sub(r"[^a-z]", "", word.lower())
         if w in CARRIERS or w in CARRIER_ALIASES:
             return True
     return False
+
+
+# Anything above this is a face amount / coverage number, never AP
+AP_MAX_SANE = 50000
+
+
+def extract_ap_amount(text):
+    """Find the AP dollar amount by taking the number that sits DIRECTLY next
+    to the word 'ap' — before it, after it, or glued to it. This is what fixes
+    entries where a face amount or coverage number is bigger than the AP:
+        AP 933 MOO 200k                        -> 933   (not 200,000)
+        AP $1,744.92 His $10K ... Hers $16K    -> 1744.92 (not 16,000)
+        348AP/ ... 40 dollar a month, for 450k -> 348   (not 450,000)
+        1,147AP/MOO h&h                        -> 1147
+        1020 AP MOO his/hers                   -> 1020
+    Returns float or None if no number is anchored to 'ap'."""
+    # 1) Number right AFTER 'ap':  ap 2040 / ap: $1,744.92 / ap 1.2k
+    m = re.search(r"\bap\b[:\s]*\$?\s?(\d[\d,]*(?:\.\d{1,2})?)\s*(k\b)?", text, re.IGNORECASE)
+    # 2) Number right BEFORE 'ap' (glued counts): 1020 ap / 1,147ap / 348ap/
+    if not m:
+        m = re.search(r"\$?(\d[\d,]*(?:\.\d{1,2})?)\s*(k\b)?\s*ap\b", text, re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        amount = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    if m.group(2):  # "ap 1.2k" -> 1200
+        amount *= 1000
+    if 0 < amount <= AP_MAX_SANE:
+        return amount
+    return None
+
+
+# Text commands that mention amounts/carriers but are NOT AP entries.
+# Without this guard, "addap @rep 500 moo" gets logged as the admin's own AP.
+_COMMAND_PREFIXES = re.compile(
+    r"^(addap|editap|editcarrier|deleteap|setweek|setmonth|adjustweek|adjustmonth|"
+    r"clearweek|clearmonth|goal|history|pastweek|pastmonth|allhours|backfill|"
+    r"setupscoreboard|setupoutput|setupannouncements|resetalldata)\b"
+)
+
+
+def detect_and_parse_ap(content):
+    """Single source of truth for reading an AP entry out of a plain-text line.
+    `content` must already be stripped + lowercased.
+
+    Returns:
+        ("ok", amount, carrier_code, was_fuzzy)  — parsed successfully
+        ("error", None, None, None)              — looked like AP but unreadable
+        None                                     — not an AP message at all
+    """
+    if _COMMAND_PREFIXES.match(content):
+        return None
+
+    ap_match = re.match(r"^ap\s+\$?([\d,]+(?:\.\d{1,2})?)\s*(k)?\s+([a-z&\s]+)$", content)
+
+    has_amount = re.search(r"\$?[\d,]+(?:\.\d{1,2})?", content) is not None
+    starts_with_ap = re.match(r"^ap(?:\s|$)", content) is not None
+    contains_ap = re.search(r"\bap\b", content) is not None
+    glued_ap = re.search(r"\d\s*ap\b", content) is not None  # "1,147ap" / "348ap/"
+
+    looks_like_ap = (
+        ap_match is not None
+        or starts_with_ap
+        or glued_ap
+        or (contains_ap and has_amount)
+        or (has_amount and carrier_mentioned(content))
+    )
+    if not looks_like_ap:
+        return None
+
+    # Strict format first: "ap [amount] [carrier]"
+    parsed = None
+    was_fuzzy = False
+    if ap_match:
+        amount = float(ap_match.group(1).replace(",", ""))
+        if ap_match.group(2):  # "ap 1.2k americo"
+            amount *= 1000
+        carrier_word = ap_match.group(3).strip()
+        resolved = resolve_carrier(carrier_word.replace(" ", ""))
+        if resolved is None:
+            # Multi-word like "mutual of omaha" — try each word
+            for word in carrier_word.split():
+                resolved = resolve_carrier(word)
+                if resolved:
+                    break
+        if resolved:
+            parsed = (amount, resolved)
+            was_fuzzy = resolved != carrier_word
+
+    if parsed is None:
+        result = try_parse_ap(content)
+        if result:
+            parsed = result
+            was_fuzzy = True
+
+    if parsed is None:
+        return ("error", None, None, None)
+    return ("ok", parsed[0], parsed[1], was_fuzzy)
+
+
+def try_parse_ap(text):
+    """Fuzzy fallback parser. Returns (amount, carrier_code) or None.
+    Handles inputs like:
+      $876 AP MOO 6 months
+      AP 933 MOO 200k (bonus coverage)     <- 200k is coverage, AP is 933
+      AP $1,744.92 His $10K & Hers $16K    <- takes the number next to 'ap'
+      348AP/ Full loan CBO100/ Americo
+      AP $1051 | UHL GI | 5 MONTHS
+      1284 Moo 24mo HH                     <- no 'ap' anchor, largest sane number
+      ap 1200 mutual of omaha              (full carrier names)
+      ap 950 amrico                        (typos)
+      ap 1.2k americo                      (k shorthand)
+    """
+    # Best signal: the number physically attached to the word 'ap'
+    amount = extract_ap_amount(text)
+
+    if amount is None:
+        # No 'ap' anchor — scan all numbers, but skip face amounts (> AP_MAX_SANE)
+        candidates = []
+        for m in re.finditer(r"(\$)?([\d,]+(?:\.\d{1,2})?)\s*(k\b)?", text, re.IGNORECASE):
+            try:
+                value = float(m.group(2).replace(",", ""))
+            except ValueError:
+                continue
+            if m.group(3):  # 1.2k -> 1200
+                value *= 1000
+            if not (0 < value <= AP_MAX_SANE):
+                continue
+            candidates.append({"value": value, "has_dollar": bool(m.group(1))})
+
+        if not candidates:
+            return None
+
+        # Prefer $-prefixed amounts; otherwise take the largest number, so
+        # "24 mos 1236 uhl" logs $1,236 — not $24.
+        dollar_amounts = [c for c in candidates if c["has_dollar"]]
+        pool = dollar_amounts if dollar_amounts else candidates
+        amount = max(c["value"] for c in pool)
+
+    # Carrier: scan every word — codes, full names, brands, and typos all resolve.
+    # Split on "/" too so "1,147AP/MOO" and "348AP/ Americo" resolve cleanly.
+    carrier_code = None
+    for word in re.split(r"[\s|/]+", text):
+        resolved = resolve_carrier(word)
+        if resolved:
+            carrier_code = resolved
+            break
+    if not carrier_code:
+        return None
+
+    return amount, carrier_code
 
 
 ADMIN_ROLE_NAMES = {
@@ -268,11 +421,12 @@ def audit(guild_id, admin, action, details):
     conn.commit()
 
 
-def add_ap(guild_id, user_id, username, amount, carrier):
+def add_ap(guild_id, user_id, username, amount, carrier, created_at=None):
+    """created_at defaults to now; backfill passes the original message date."""
     cur.execute("""
     INSERT INTO ap_entries (guild_id, user_id, username, amount, carrier, created_at)
     VALUES (?, ?, ?, ?, ?, ?)
-    """, (str(guild_id), str(user_id), username, amount, carrier, now_iso()))
+    """, (str(guild_id), str(user_id), username, amount, carrier, created_at or now_iso()))
     conn.commit()
     return cur.lastrowid
 
@@ -954,75 +1108,54 @@ async def send_whale_alert(author, amount, carrier_code, week_total, out):
     await out.send(embed=whale)
 
 
-async def record_ap_entry(guild_id, author, channel_id, amount, carrier_code, was_fuzzy, out):
+async def record_ap_entry(guild_id, author, channel_id, amount, carrier_code, was_fuzzy, out, source_message=None):
     """Full AP logging pipeline — shared by text entries and /ap.
-    Saves the entry, posts the confirmation, updates the live scoreboard,
-    and fires position / level-up / whale alerts."""
+    Saves the entry, confirms to the rep, updates the live scoreboard,
+    and fires position / level-up / whale alerts.
+
+    Confirmation behavior:
+      - /ap slash entries: the ephemeral "Only you can see this" reply
+        (sent by the slash handler) is the confirmation.
+      - Typed entries (source_message given): a compact reply directly
+        under the rep's message showing exactly what was logged, which
+        self-deletes after a few seconds. Discord doesn't allow true
+        ephemeral messages for typed text, so this is the closest thing.
+    """
     old_top_10 = leaderboard_snapshot(guild_id, "week", 10)
     old_month_total = user_total(guild_id, author.id, "month")
 
     entry_id = add_ap(guild_id, author.id, author.display_name, amount, carrier_code)
 
-    today_total = user_total(guild_id, author.id, "today")
     week_total = user_total(guild_id, author.id, "week")
     month_total = user_total(guild_id, author.id, "month")
 
-    week_goal = get_goal(guild_id, author.id, "week")
-    month_goal = get_goal(guild_id, author.id, "month")
-
-    week_rank = rank_for_user(guild_id, author.id, "week")
-    month_rank = rank_for_user(guild_id, author.id, "month")
-
-    embed = make_embed(f"💰 AP RECORDED — {CARRIERS[carrier_code]}", color=C_GOLD)
-
-    embed.add_field(name="Rep", value=f"<@{author.id}>", inline=True)
-    embed.add_field(name="AP Submitted", value=f"**{money(amount)}**", inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=True)
-
-    week_rank_display = f"#{week_rank}" if week_rank else "—"
-    month_rank_display = f"#{month_rank}" if month_rank else "—"
-
-    embed.add_field(name="📅 Today", value=money(today_total), inline=True)
-    embed.add_field(
-        name=f"📈 Week  ·  Rank {week_rank_display}",
-        value=f"{money(week_total)}\n{progress_text(week_total, week_goal)}",
-        inline=True
-    )
-    embed.add_field(
-        name=f"👑 Month  ·  Rank {month_rank_display}",
-        value=f"{money(month_total)}\n{progress_text(month_total, month_goal)}",
-        inline=True
-    )
-    embed.add_field(name="Status", value=status_progress_text(month_total), inline=False)
-
-    if was_fuzzy:
-        embed.add_field(
-            name="⚠️ Auto-Parsed",
-            value=(
-                f"I read this from your message and logged it automatically.\n"
-                f"Amount: **{money(amount)}**  ·  Carrier: **{CARRIERS[carrier_code]}**\n"
-                f"If that's wrong, use `deleteap {entry_id}` to remove it."
-            ),
-            inline=False
+    if source_message is not None:
+        confirm = (
+            f"💰 Logged **{money(amount)}** — **{CARRIERS[carrier_code]}**"
+            f"  ·  Entry #{entry_id}  ·  Week: **{money(week_total)}**"
         )
+        # Auto-parsed entries stay up longer so a bad read gets caught
+        delete_after = 12
+        if was_fuzzy:
+            confirm += f"\n⚠️ Auto-parsed from your message — wrong? `deleteap {entry_id}`"
+            delete_after = 25
 
-    scoreboard_ch_id = get_setting(guild_id, "scoreboard_channel_id")
-    output_ch_id = get_setting(guild_id, "output_channel_id")
-    typed_in_wrong_channel = (
-        output_ch_id and scoreboard_ch_id and channel_id is not None
-        and str(channel_id) != str(scoreboard_ch_id)
-        and str(channel_id) != str(output_ch_id)
-    )
-    if typed_in_wrong_channel:
-        embed.add_field(
-            name="📍 Heads up",
-            value=f"Log AP in <#{scoreboard_ch_id}> so the live board stays current.",
-            inline=False
+        scoreboard_ch_id = get_setting(guild_id, "scoreboard_channel_id")
+        output_ch_id = get_setting(guild_id, "output_channel_id")
+        typed_in_wrong_channel = (
+            output_ch_id and scoreboard_ch_id and channel_id is not None
+            and str(channel_id) != str(scoreboard_ch_id)
+            and str(channel_id) != str(output_ch_id)
         )
+        if typed_in_wrong_channel:
+            confirm += f"\n📍 Log AP in <#{scoreboard_ch_id}> so the live board stays current."
+            delete_after = 25
 
-    embed.set_footer(text=f"Entry #{entry_id}")
+        try:
+            await source_message.reply(confirm, delete_after=delete_after, mention_author=False)
+        except discord.HTTPException:
+            pass
 
-    await out.send(embed=embed)
     await update_scoreboard(guild_id)
 
     new_top_10 = leaderboard_snapshot(guild_id, "week", 10)
@@ -1600,8 +1733,10 @@ async def process_line(message, raw_line, guild_id, out):
         embed = make_embed("📤 OUTPUT CHANNEL SET", color=C_GREEN)
         embed.description = (
             f"All bot responses will now post here.\n\n"
-            f"Reps can submit AP in any channel — confirmations, alerts, "
-            f"leaderboards, and errors will all route to <#{message.channel.id}>.\n\n"
+            f"Reps can submit AP in any channel — alerts, leaderboards, and "
+            f"errors will all route to <#{message.channel.id}>. Each rep gets "
+            f"a quick confirmation (amount + carrier logged) replied under "
+            f"their message, which clears itself after a few seconds.\n\n"
             f"To reset, run `setupoutput` again in a different channel."
         )
         await message.channel.send(embed=embed)
@@ -1626,103 +1761,100 @@ async def process_line(message, raw_line, guild_id, out):
         await out.send(embed=embed)
         return
 
+    # ── Backfill: recover AP entries the bot missed or mis-parsed ─────────────
+    # Run IN the channel you want scanned (your scoreboard channel):
+    #   backfill        -> scans the last 30 days
+    #   backfill 90     -> scans the last 90 days
+    # Re-parses every message with the current parser, keeps original dates,
+    # and skips anything already logged (same rep + same amount + same day).
+    if content.startswith("backfill"):
+        if not is_admin(message.author):
+            await send_admin_error(out)
+            return
+
+        bf_match = re.match(r"^backfill(?:\s+(\d+))?$", content)
+        if not bf_match:
+            err = make_embed("❌ Bad Format", color=C_RED)
+            err.description = "Use `backfill` or `backfill [days]` — e.g. `backfill 90`"
+            await out.send(embed=err)
+            return
+
+        days = int(bf_match.group(1) or 30)
+        days = min(days, 365)
+        cutoff = datetime.now(ZoneInfo("UTC")) - timedelta(days=days)
+
+        working = make_embed("🔎 BACKFILL RUNNING", color=C_SILVER)
+        working.description = (
+            f"Scanning <#{message.channel.id}> for the last **{days} days**...\n"
+            f"This can take a minute on busy channels."
+        )
+        await out.send(embed=working)
+
+        found = 0
+        skipped = 0
+        recovered_total = 0.0
+
+        async for old_msg in message.channel.history(after=cutoff, limit=None, oldest_first=True):
+            if old_msg.author.bot:
+                continue
+            for old_line in old_msg.content.split("\n"):
+                line = old_line.strip().lower()
+                if not line:
+                    continue
+                parsed = detect_and_parse_ap(line)
+                if parsed is None or parsed[0] != "ok":
+                    continue
+                _, amount, carrier_code, _fuzzy = parsed
+                if carrier_code not in CARRIERS:
+                    continue
+
+                created = old_msg.created_at.astimezone(CENTRAL)
+                day = created.date().isoformat()
+
+                # Dedupe: same rep + same amount + same calendar day = already logged
+                dup = cur.execute(
+                    "SELECT 1 FROM ap_entries WHERE guild_id = ? AND user_id = ? "
+                    "AND amount = ? AND created_at LIKE ? LIMIT 1",
+                    (str(guild_id), str(old_msg.author.id), amount, f"{day}%"),
+                ).fetchone()
+                if dup:
+                    skipped += 1
+                    continue
+
+                add_ap(
+                    guild_id, old_msg.author.id, old_msg.author.display_name,
+                    amount, carrier_code, created_at=created.isoformat(),
+                )
+                found += 1
+                recovered_total += amount
+                try:
+                    await old_msg.add_reaction("\N{WHITE HEAVY CHECK MARK}")
+                except discord.HTTPException:
+                    pass
+
+        await update_scoreboard(guild_id)
+        audit(guild_id, message.author, "backfill",
+              f"{days}d scan of #{message.channel.name}: {found} recovered ({money(recovered_total)}), {skipped} already logged")
+
+        done = make_embed("✅ BACKFILL COMPLETE", color=C_GOLD)
+        done.description = (
+            f"**{found} entries recovered** — {money(recovered_total)} AP\n"
+            f"**{skipped} skipped** (already logged)\n\n"
+            f"Recovered entries keep their **original dates**, so weekly and "
+            f"monthly totals are now accurate. Every recovered message got a ✅.\n\n"
+            f"Spot one that's wrong? `history @rep` to find it, then `editap` or `deleteap`."
+        )
+        await out.send(embed=done)
+        return
+
     # ── AP entry detection ────────────────────────────────────────────────────
-    # Tries strict format first, then falls back to fuzzy parsing.
-    # Fuzzy: extract any dollar amount + any carrier keyword from anywhere in the message.
+    # Shared parser (detect_and_parse_ap) — same logic used by `backfill`.
+    result = detect_and_parse_ap(content)
 
-    def try_parse_ap(text):
-        """
-        Returns (amount, carrier_code) or None if nothing parseable found.
-        Handles inputs like:
-          $876 AP MOO 6 months
-          $1,236 AP UHL GI 24 mos
-          AP 1315.20 Trans
-          AP $1051 | UHL GI | 5 MONTHS
-          1284 Moo 24mo HH
-          ap 1200 mutual of omaha     (full carrier names)
-          ap 950 amrico               (typos)
-          ap 1.2k americo             (k shorthand)
-          24 mos 1236 uhl             (amount isn't the first number)
-        """
-        # Find ALL candidate amounts, noting $-prefix and k-suffix
-        candidates = []
-        for m in re.finditer(r"(\$)?([\d,]+(?:\.\d{1,2})?)\s*(k\b)?", text, re.IGNORECASE):
-            try:
-                value = float(m.group(2).replace(",", ""))
-            except ValueError:
-                continue
-            if m.group(3):  # 1.2k -> 1200
-                value *= 1000
-            if value <= 0:
-                continue
-            candidates.append({"value": value, "has_dollar": bool(m.group(1))})
+    if result is not None:
+        status, amount, carrier_code, was_fuzzy = result
 
-        if not candidates:
-            return None
-
-        # Prefer $-prefixed amounts; otherwise take the largest number, so
-        # "24 mos 1236 uhl" logs $1,236 — not $24.
-        dollar_amounts = [c for c in candidates if c["has_dollar"]]
-        pool = dollar_amounts if dollar_amounts else candidates
-        amount = max(c["value"] for c in pool)
-
-        # Carrier: scan every word — codes, full names, brands, and typos all resolve
-        carrier_code = None
-        for word in re.split(r"[\s|]+", text):
-            resolved = resolve_carrier(word)
-            if resolved:
-                carrier_code = resolved
-                break
-        if not carrier_code:
-            return None
-
-        return amount, carrier_code
-
-    ap_match = re.match(r"^ap\s+\$?([\d,]+(?:\.\d{1,2})?)\s*(k)?\s+([a-z&\s]+)$", content)
-
-    amount_match = re.search(r"\$?[\d,]+(?:\.\d{1,2})?", content)
-    has_amount = amount_match is not None
-    has_known_carrier = carrier_mentioned(content)
-    starts_with_ap = re.match(r"^ap(?:\s|$)", content) is not None
-    contains_ap = re.search(r"\bap\b", content) is not None
-
-    # Only treat chat as AP when it clearly looks like an AP entry. This avoids
-    # noisy alerts for normal messages that happen to mention "AP" or money.
-    looks_like_ap = (
-        ap_match is not None
-        or starts_with_ap
-        or (contains_ap and has_amount)
-        or (has_amount and has_known_carrier)
-    )
-
-    if looks_like_ap:
-        # Try strict format first: "ap [amount] [carrier]"
-        parsed = None
-        was_fuzzy = False
-        if ap_match:
-            amount = float(ap_match.group(1).replace(",", ""))
-            if ap_match.group(2):  # "ap 1.2k americo"
-                amount *= 1000
-            carrier_word = ap_match.group(3).strip()
-            resolved = resolve_carrier(carrier_word.replace(" ", ""))
-            if resolved is None:
-                # Multi-word like "mutual of omaha" — try each word
-                for word in carrier_word.split():
-                    resolved = resolve_carrier(word)
-                    if resolved:
-                        break
-            if resolved:
-                parsed = (amount, resolved)
-                # Flag as auto-parsed if we had to correct their carrier
-                was_fuzzy = resolved != carrier_word
-
-        if parsed is None:
-            result = try_parse_ap(content)
-            if result:
-                parsed = result
-                was_fuzzy = True
-
-        if parsed is None:
+        if status == "error":
             err = make_embed("❌ Couldn't Parse Your Entry", color=C_RED)
             err.description = (
                 "I found something that looked like an AP entry but couldn't read the amount or carrier.\n\n"
@@ -1733,7 +1865,6 @@ async def process_line(message, raw_line, guild_id, out):
             await out.send(embed=err)
             return
 
-        amount, carrier_code = parsed
         if carrier_code not in CARRIERS:
             err = make_embed("❌ Unknown Carrier", color=C_RED)
             err.description = "Valid codes: `amam` `sbli` `ahl` `americo` `moo` `nlg` `trans` `uhl` `lga` `lb`"
@@ -1742,8 +1873,15 @@ async def process_line(message, raw_line, guild_id, out):
 
         await record_ap_entry(
             guild_id, message.author, message.channel.id,
-            amount, carrier_code, was_fuzzy, out
+            amount, carrier_code, was_fuzzy, out,
+            source_message=message
         )
+        # Instant ✅ on the rep's own message — confirms it counted without
+        # them having to check the output channel. No ✅ = it didn't log.
+        try:
+            await message.add_reaction("\N{WHITE HEAVY CHECK MARK}")
+        except discord.HTTPException:
+            pass
         return
 
 
