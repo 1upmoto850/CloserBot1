@@ -1114,27 +1114,36 @@ async def record_ap_entry(guild_id, author, channel_id, amount, carrier_code, wa
     and fires position / level-up / whale alerts.
 
     Confirmation behavior:
-      - /ap slash entries: the ephemeral "Only you can see this" reply
-        (sent by the slash handler) is the confirmation.
-      - Typed entries (source_message given): a compact reply directly
-        under the rep's message showing exactly what was logged, which
-        self-deletes after a few seconds. Discord doesn't allow true
-        ephemeral messages for typed text, so this is the closest thing.
+      - Public: the full "AP RECORDED" card posts to the output channel
+        (team stats feed) for every entry, text or slash.
+      - Private: typed entries also get a compact self-deleting reply
+        under the rep's message with the exact parsed amount + any
+        auto-parse warning. /ap entries get their ephemeral reply instead.
     """
     old_top_10 = leaderboard_snapshot(guild_id, "week", 10)
     old_month_total = user_total(guild_id, author.id, "month")
 
     entry_id = add_ap(guild_id, author.id, author.display_name, amount, carrier_code)
 
+    today_total = user_total(guild_id, author.id, "today")
     week_total = user_total(guild_id, author.id, "week")
     month_total = user_total(guild_id, author.id, "month")
 
+    week_goal = get_goal(guild_id, author.id, "week")
+    month_goal = get_goal(guild_id, author.id, "month")
+
+    week_rank = rank_for_user(guild_id, author.id, "week")
+    month_rank = rank_for_user(guild_id, author.id, "month")
+
+    # ── Private receipt (typed entries only) ─────────────────────────────
+    # Compact reply under the rep's message showing exactly what was logged,
+    # self-deletes so the channel stays clean. Parse warnings live here, not
+    # on the public card.
     if source_message is not None:
         confirm = (
             f"💰 Logged **{money(amount)}** — **{CARRIERS[carrier_code]}**"
             f"  ·  Entry #{entry_id}  ·  Week: **{money(week_total)}**"
         )
-        # Auto-parsed entries stay up longer so a bad read gets caught
         delete_after = 12
         if was_fuzzy:
             confirm += f"\n⚠️ Auto-parsed from your message — wrong? `deleteap {entry_id}`"
@@ -1156,6 +1165,31 @@ async def record_ap_entry(guild_id, author, channel_id, amount, carrier_code, wa
         except discord.HTTPException:
             pass
 
+    # ── Public card → output channel (team stats feed) ───────────────────
+    embed = make_embed(f"💰 AP RECORDED — {CARRIERS[carrier_code]}", color=C_GOLD)
+
+    embed.add_field(name="Rep", value=f"<@{author.id}>", inline=True)
+    embed.add_field(name="AP Submitted", value=f"**{money(amount)}**", inline=True)
+    embed.add_field(name="\u200b", value="\u200b", inline=True)
+
+    week_rank_display = f"#{week_rank}" if week_rank else "—"
+    month_rank_display = f"#{month_rank}" if month_rank else "—"
+
+    embed.add_field(name="📅 Today", value=money(today_total), inline=True)
+    embed.add_field(
+        name=f"📈 Week  ·  Rank {week_rank_display}",
+        value=f"{money(week_total)}\n{progress_text(week_total, week_goal)}",
+        inline=True
+    )
+    embed.add_field(
+        name=f"👑 Month  ·  Rank {month_rank_display}",
+        value=f"{money(month_total)}\n{progress_text(month_total, month_goal)}",
+        inline=True
+    )
+    embed.add_field(name="Status", value=status_progress_text(month_total), inline=False)
+    embed.set_footer(text=f"Entry #{entry_id}")
+
+    await out.send(embed=embed)
     await update_scoreboard(guild_id)
 
     new_top_10 = leaderboard_snapshot(guild_id, "week", 10)
