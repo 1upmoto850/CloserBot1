@@ -1621,6 +1621,94 @@ async def slash_leaderboard(interaction: discord.Interaction, period: app_comman
     await slash_route_embed(interaction, leaderboard_embed(str(interaction.guild.id), p))
 
 
+# ── /fullboard — full paged leaderboard (ephemeral, does not touch /leaderboard) ──
+FULLBOARD_PAGE_SIZE = 10
+
+
+def fullboard_page_embed(guild_id, period, rows, page):
+    title_map = {
+        "today": "📅 Today's Full Leaderboard",
+        "week": "📈 Weekly Full Leaderboard",
+        "month": "👑 Monthly Full Leaderboard",
+    }
+    color_map = {"today": C_NAVY, "week": C_GOLD, "month": C_PURPLE}
+    total_pages = max(1, (len(rows) + FULLBOARD_PAGE_SIZE - 1) // FULLBOARD_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * FULLBOARD_PAGE_SIZE
+    chunk = rows[start:start + FULLBOARD_PAGE_SIZE]
+
+    embed = make_embed(title_map[period], color=color_map[period])
+    if not rows:
+        embed.description = "No AP submitted yet — be the first on the board."
+        return embed, total_pages
+
+    medals = ["🥇", "🥈", "🥉"]
+    text = ""
+    for i, row in enumerate(chunk, start=start + 1):
+        icon = medals[i - 1] if i <= 3 else f"`{i}.`"
+        text += f"{icon} **{row['username']}**: {money(row['total'])}\n"
+    embed.description = text
+    embed.add_field(name="Team Total", value=money(team_total(guild_id, period)), inline=False)
+    embed.set_footer(text=f"Page {page + 1}/{total_pages}  ·  {len(rows)} reps on the board")
+    return embed, total_pages
+
+
+class FullBoardView(discord.ui.View):
+    def __init__(self, guild_id, period, rows, author_id):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+        self.period = period
+        self.rows = rows
+        self.author_id = author_id
+        self.page = 0
+        self._sync_buttons()
+
+    def _sync_buttons(self):
+        total_pages = max(1, (len(self.rows) + FULLBOARD_PAGE_SIZE - 1) // FULLBOARD_PAGE_SIZE)
+        self.prev_btn.disabled = self.page <= 0
+        self.next_btn.disabled = self.page >= total_pages - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Run /fullboard yourself to page through it.", ephemeral=True)
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction):
+        self._sync_buttons()
+        embed, _ = fullboard_page_embed(self.guild_id, self.period, self.rows, self.page)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.primary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        await self._refresh(interaction)
+
+
+@tree.command(name="fullboard", description="Full AP leaderboard past the top 10 — paged, only you can see it")
+@app_commands.describe(period="Which time range to show (default: this week)")
+@app_commands.choices(period=[
+    app_commands.Choice(name="Today", value="today"),
+    app_commands.Choice(name="This Week", value="week"),
+    app_commands.Choice(name="This Month", value="month"),
+])
+async def slash_fullboard(interaction: discord.Interaction, period: app_commands.Choice[str] = None):
+    if interaction.guild is None:
+        await interaction.response.send_message("Use this in a server, not DMs.", ephemeral=True)
+        return
+    p = period.value if period else "week"
+    gid = str(interaction.guild.id)
+    rows = [r for r in leaderboard(gid, p, 10000) if (r["total"] or 0) > 0]
+    embed, _ = fullboard_page_embed(gid, p, rows, 0)
+    view = FullBoardView(gid, p, rows, interaction.user.id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
 @tree.command(name="levels", description="The monthly AP status tiers, Noob to God Mode")
 async def slash_levels(interaction: discord.Interaction):
     await interaction.response.send_message(embed=levels_embed(), ephemeral=True)
@@ -2461,7 +2549,7 @@ async def process_line(message, raw_line, guild_id, out):
         )
         embed.add_field(
             name="🏆 Leaderboards",
-            value="`/leaderboard` — pick today · week · month\nor type `daily`  ·  `weekly`  ·  `monthly`",
+            value="`/leaderboard` — top 10, pick today · week · month\nor type `daily`  ·  `weekly`  ·  `monthly`\n`/fullboard` — everyone past the top 10, paged (only you see it)",
             inline=False
         )
         embed.add_field(
