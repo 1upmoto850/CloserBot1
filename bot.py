@@ -352,6 +352,34 @@ CREATE TABLE IF NOT EXISTS hours_log (
 )
 """)
 
+
+# ── Daily KPI check-ins ───────────────────────────────────────────────────────
+cur.execute("""
+CREATE TABLE IF NOT EXISTS daily_kpi (
+    guild_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    username TEXT NOT NULL,
+    day TEXT NOT NULL,
+    dials INTEGER NOT NULL DEFAULT 0,
+    pickups INTEGER NOT NULL DEFAULT 0,
+    appointments INTEGER NOT NULL DEFAULT 0,
+    presentations INTEGER NOT NULL DEFAULT 0,
+    closes INTEGER NOT NULL DEFAULT 0,
+    submitted_at TEXT NOT NULL,
+    PRIMARY KEY (guild_id, user_id, day)
+)
+""")
+
+# Daily KPI reminder preference. Missing row = reminders ON.
+cur.execute("""
+CREATE TABLE IF NOT EXISTS dm_preferences (
+    guild_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    daily_kpi_dm INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (guild_id, user_id)
+)
+""")
+
 # ── Migration: add guild_id column to existing tables if missing ──────────────
 # Safe to run on every startup — ALTER TABLE is a no-op if column exists would
 # raise OperationalError, so we check first.
@@ -706,6 +734,329 @@ def get_all_guild_ids():
     """Return all guild IDs that have any settings configured (for scheduler use)."""
     cur.execute("SELECT DISTINCT guild_id FROM settings WHERE guild_id != '0'")
     return [row["guild_id"] for row in cur.fetchall()]
+
+
+
+# ── KPI check-in + DM preferences ─────────────────────────────────────────────
+
+DEFAULT_KPI_ROLE = "sales rep"
+
+
+def kpi_day():
+    return now_central().strftime("%Y-%m-%d")
+
+
+def save_kpi(guild_id, user_id, username, dials, pickups, appointments, presentations, closes, day=None):
+    day = day or kpi_day()
+    cur.execute("""
+    INSERT INTO daily_kpi
+        (guild_id, user_id, username, day, dials, pickups, appointments, presentations, closes, submitted_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(guild_id, user_id, day)
+    DO UPDATE SET
+        username=excluded.username,
+        dials=excluded.dials,
+        pickups=excluded.pickups,
+        appointments=excluded.appointments,
+        presentations=excluded.presentations,
+        closes=excluded.closes,
+        submitted_at=excluded.submitted_at
+    """, (
+        str(guild_id), str(user_id), username, day,
+        int(dials), int(pickups), int(appointments), int(presentations), int(closes),
+        now_iso()
+    ))
+    conn.commit()
+
+
+def get_kpi_day(guild_id, user_id, day=None):
+    day = day or kpi_day()
+    cur.execute("""
+    SELECT * FROM daily_kpi
+    WHERE guild_id=? AND user_id=? AND day=?
+    """, (str(guild_id), str(user_id), day))
+    return cur.fetchone()
+
+
+def kpi_period_start_day(period):
+    return get_start(period).strftime("%Y-%m-%d")
+
+
+def rep_kpi_totals(guild_id, user_id, period):
+    cur.execute("""
+    SELECT
+        COALESCE(SUM(dials), 0) dials,
+        COALESCE(SUM(pickups), 0) pickups,
+        COALESCE(SUM(appointments), 0) appointments,
+        COALESCE(SUM(presentations), 0) presentations,
+        COALESCE(SUM(closes), 0) closes,
+        COUNT(*) days_reported
+    FROM daily_kpi
+    WHERE guild_id=? AND user_id=? AND day>=?
+    """, (str(guild_id), str(user_id), kpi_period_start_day(period)))
+    return cur.fetchone()
+
+
+def team_kpi_totals(guild_id, period):
+    cur.execute("""
+    SELECT
+        COALESCE(SUM(dials), 0) dials,
+        COALESCE(SUM(pickups), 0) pickups,
+        COALESCE(SUM(appointments), 0) appointments,
+        COALESCE(SUM(presentations), 0) presentations,
+        COALESCE(SUM(closes), 0) closes,
+        COUNT(DISTINCT user_id || ':' || day) checkins,
+        COUNT(DISTINCT user_id) reps_reported
+    FROM daily_kpi
+    WHERE guild_id=? AND day>=?
+    """, (str(guild_id), kpi_period_start_day(period)))
+    return cur.fetchone()
+
+
+def pct(num, den):
+    if not den:
+        return "0.0%"
+    return f"{(num / den) * 100:.1f}%"
+
+
+def per(value, den):
+    if not den:
+        return "$0.00"
+    return money(value / den)
+
+
+def dm_enabled(guild_id, user_id):
+    cur.execute("""
+    SELECT daily_kpi_dm FROM dm_preferences
+    WHERE guild_id=? AND user_id=?
+    """, (str(guild_id), str(user_id)))
+    row = cur.fetchone()
+    return True if row is None else bool(row["daily_kpi_dm"])
+
+
+def set_dm_enabled(guild_id, user_id, enabled):
+    cur.execute("""
+    INSERT INTO dm_preferences (guild_id, user_id, daily_kpi_dm)
+    VALUES (?, ?, ?)
+    ON CONFLICT(guild_id, user_id)
+    DO UPDATE SET daily_kpi_dm=excluded.daily_kpi_dm
+    """, (str(guild_id), str(user_id), 1 if enabled else 0))
+    conn.commit()
+
+
+def configured_kpi_role_name(guild_id):
+    return get_setting(guild_id, "kpi_role_name") or DEFAULT_KPI_ROLE
+
+
+def is_kpi_rep(member):
+    if member.bot:
+        return False
+    wanted = configured_kpi_role_name(member.guild.id).lower()
+    return any(role.name.lower() == wanted for role in member.roles)
+
+
+def eligible_kpi_members(guild):
+    return [m for m in guild.members if is_kpi_rep(m)]
+
+
+def kpi_missing_members(guild):
+    gid = str(guild.id)
+    day = kpi_day()
+    cur.execute("""
+    SELECT user_id FROM daily_kpi
+    WHERE guild_id=? AND day=?
+    """, (gid, day))
+    submitted = {row["user_id"] for row in cur.fetchall()}
+    return [m for m in eligible_kpi_members(guild) if str(m.id) not in submitted]
+
+
+def rep_kpi_embed(guild_id, member, period="today"):
+    vals = rep_kpi_totals(guild_id, member.id, period)
+    ap = user_total(guild_id, member.id, period)
+
+    embed = make_embed(f"📊 {member.display_name} — {period.title()} KPI", color=C_NAVY)
+    embed.add_field(
+        name="Activity",
+        value=(
+            f"📞 Dials: **{vals['dials']:,}**\n"
+            f"☎️ Pickups: **{vals['pickups']:,}**\n"
+            f"📅 Appointments: **{vals['appointments']:,}**\n"
+            f"🎤 Presentations: **{vals['presentations']:,}**\n"
+            f"✅ Closes: **{vals['closes']:,}**"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="Conversion",
+        value=(
+            f"Contact: **{pct(vals['pickups'], vals['dials'])}**\n"
+            f"Appt Set: **{pct(vals['appointments'], vals['pickups'])}**\n"
+            f"Presentation: **{pct(vals['presentations'], vals['appointments'])}**\n"
+            f"Close: **{pct(vals['closes'], vals['presentations'])}**"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="Production",
+        value=(
+            f"💰 AP: **{money(ap)}**\n"
+            f"AP / Close: **{per(ap, vals['closes'])}**\n"
+            f"AP / Presentation: **{per(ap, vals['presentations'])}**\n"
+            f"AP / Dial: **{per(ap, vals['dials'])}**"
+        ),
+        inline=False
+    )
+    if period != "today":
+        embed.set_footer(text=f"{vals['days_reported']} daily check-in(s) submitted in this period")
+    else:
+        embed.set_footer(text="Use /checkin again anytime today to update your numbers.")
+    return embed
+
+
+def team_kpi_embed(guild_id, period="today"):
+    vals = team_kpi_totals(guild_id, period)
+    ap = team_total(guild_id, period)
+
+    embed = make_embed(f"🏢 TEAM KPI — {period.title()}", color=C_GOLD)
+    embed.add_field(
+        name="Team Activity",
+        value=(
+            f"📞 Dials: **{vals['dials']:,}**\n"
+            f"☎️ Pickups: **{vals['pickups']:,}**\n"
+            f"📅 Appointments: **{vals['appointments']:,}**\n"
+            f"🎤 Presentations: **{vals['presentations']:,}**\n"
+            f"✅ Closes: **{vals['closes']:,}**"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="Team Conversion",
+        value=(
+            f"Contact: **{pct(vals['pickups'], vals['dials'])}**\n"
+            f"Appt Set: **{pct(vals['appointments'], vals['pickups'])}**\n"
+            f"Presentation: **{pct(vals['presentations'], vals['appointments'])}**\n"
+            f"Close: **{pct(vals['closes'], vals['presentations'])}**"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="Production",
+        value=(
+            f"💰 AP: **{money(ap)}**\n"
+            f"AP / Close: **{per(ap, vals['closes'])}**\n"
+            f"AP / Presentation: **{per(ap, vals['presentations'])}**\n"
+            f"AP / Dial: **{per(ap, vals['dials'])}**"
+        ),
+        inline=False
+    )
+    embed.set_footer(text=f"{vals['reps_reported']} rep(s) reported · {vals['checkins']} check-in(s)")
+    return embed
+
+
+def mark_once(guild_id, key, value):
+    old = get_setting(guild_id, key)
+    if old == str(value):
+        return False
+    set_setting(guild_id, key, value)
+    return True
+
+
+class KPICheckinModal(discord.ui.Modal, title="Daily KPI Check-In"):
+    def __init__(self, guild_id, existing=None):
+        super().__init__(timeout=300)
+        self.guild_id = str(guild_id)
+        existing = existing or {}
+
+        def old(name):
+            try:
+                return str(existing[name])
+            except Exception:
+                return "0"
+
+        self.dials = discord.ui.TextInput(label="Dials", placeholder="Example: 350", default=old("dials"), required=True, max_length=6)
+        self.pickups = discord.ui.TextInput(label="Pickups", placeholder="Example: 45", default=old("pickups"), required=True, max_length=6)
+        self.appointments = discord.ui.TextInput(label="Appointments Set", placeholder="Example: 12", default=old("appointments"), required=True, max_length=6)
+        self.presentations = discord.ui.TextInput(label="Presentations", placeholder="Example: 7", default=old("presentations"), required=True, max_length=6)
+        self.closes = discord.ui.TextInput(label="Closes", placeholder="Example: 3", default=old("closes"), required=True, max_length=6)
+
+        for item in (self.dials, self.pickups, self.appointments, self.presentations, self.closes):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            values = [
+                int(self.dials.value.strip()),
+                int(self.pickups.value.strip()),
+                int(self.appointments.value.strip()),
+                int(self.presentations.value.strip()),
+                int(self.closes.value.strip()),
+            ]
+        except ValueError:
+            await interaction.response.send_message("Use whole numbers only for all five fields.", ephemeral=True)
+            return
+
+        if any(v < 0 for v in values):
+            await interaction.response.send_message("KPI numbers cannot be negative.", ephemeral=True)
+            return
+
+        dials, pickups, appointments, presentations, closes = values
+        save_kpi(
+            self.guild_id, interaction.user.id, interaction.user.display_name,
+            dials, pickups, appointments, presentations, closes
+        )
+        ap = user_total(self.guild_id, interaction.user.id, "today")
+
+        embed = make_embed("✅ DAILY CHECK-IN SAVED", color=C_GREEN)
+        embed.description = (
+            f"📞 **{dials:,}** dials  ·  ☎️ **{pickups:,}** pickups\n"
+            f"📅 **{appointments:,}** appointments  ·  🎤 **{presentations:,}** presentations\n"
+            f"✅ **{closes:,}** closes  ·  💰 **{money(ap)} AP**\n\n"
+            f"Close Rate: **{pct(closes, presentations)}**"
+        )
+        embed.set_footer(text="Run /checkin again today if you need to correct anything.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class CheckinPromptView(discord.ui.View):
+    def __init__(self, guild_id):
+        super().__init__(timeout=None)
+        self.guild_id = str(guild_id)
+        self.submit.custom_id = f"closerbot_kpi_checkin:{self.guild_id}"
+
+    @discord.ui.button(label="Submit Daily Check-In", style=discord.ButtonStyle.success, custom_id="closerbot_kpi_checkin")
+    async def submit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        existing = get_kpi_day(self.guild_id, interaction.user.id)
+        await interaction.response.send_modal(KPICheckinModal(self.guild_id, existing))
+
+
+async def send_kpi_dm_prompt(guild, reminder=False):
+    gid = str(guild.id)
+    missing = kpi_missing_members(guild)
+    sent = 0
+
+    for member in missing:
+        if not dm_enabled(gid, member.id):
+            continue
+
+        ap = user_total(gid, member.id, "today")
+        embed = make_embed(
+            "⏰ KPI CHECK-IN REMINDER" if reminder else "📊 DAILY KPI CHECK-IN",
+            color=C_ORANGE if reminder else C_NAVY
+        )
+        embed.description = (
+            f"Hey **{member.display_name}**, log today's numbers before you sign off.\n\n"
+            f"CloserBot already has your AP today: **{money(ap)}**\n"
+            f"You only need to enter:\n"
+            f"📞 Dials · ☎️ Pickups · 📅 Appointments · 🎤 Presentations · ✅ Closes\n\n"
+            f"Don't want these daily reminders? Use `/dms off` in the server."
+        )
+        try:
+            await member.send(embed=embed, view=CheckinPromptView(gid))
+            sent += 1
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    return sent
 
 
 # ── Hours tracking (cam + mic required) ──────────────────────────────────────
@@ -1419,6 +1770,20 @@ async def scheduler():
         if tomorrow.month != now.date().month and hour == 20 and minute == 25:
             await post_to_announcements(gid, monthly_hours_embed(gid))
 
+        # Daily KPI check-in DM: Mon–Fri at 7:00 PM Central
+        if weekday <= 4 and hour == 19 and minute == 0:
+            if mark_once(gid, "kpi_dm_1900_date", now.date().isoformat()):
+                guild = client.get_guild(int(gid))
+                if guild:
+                    await send_kpi_dm_prompt(guild, reminder=False)
+
+        # Reminder only to reps still missing: Mon–Fri at 7:30 PM Central
+        if weekday <= 4 and hour == 19 and minute == 30:
+            if mark_once(gid, "kpi_dm_1930_date", now.date().isoformat()):
+                guild = client.get_guild(int(gid))
+                if guild:
+                    await send_kpi_dm_prompt(guild, reminder=True)
+
         # Monday 00:01 — clear this guild's weekly overrides
         if weekday == 0 and hour == 0 and minute == 1:
             cur.execute("DELETE FROM ap_overrides WHERE guild_id=? AND period='week'", (gid,))
@@ -1557,17 +1922,31 @@ async def slash_ap(interaction: discord.Interaction, amount: float, carrier: app
     if interaction.guild is None:
         await interaction.response.send_message("Use this in a server, not DMs.", ephemeral=True)
         return
+
+    gid = str(interaction.guild.id)
+    scoreboard_id = get_setting(gid, "scoreboard_channel_id")
+    if not scoreboard_id:
+        await interaction.response.send_message(
+            "The scoreboard channel has not been configured yet. Ask a manager to run `/setupscoreboard` in the scoreboard channel.",
+            ephemeral=True
+        )
+        return
+    if str(interaction.channel.id) != str(scoreboard_id):
+        await interaction.response.send_message(
+            f"AP only counts in <#{scoreboard_id}>. Run `/ap` there so it hits the live scoreboard.",
+            ephemeral=True
+        )
+        return
+
     if amount <= 0:
         await interaction.response.send_message("Amount has to be more than $0.", ephemeral=True)
         return
-    if amount > 1_000_000:
-        await interaction.response.send_message("That amount looks off — double-check and try again.", ephemeral=True)
+    if amount > AP_MAX_SANE:
+        await interaction.response.send_message("That AP amount looks off — double-check and try again.", ephemeral=True)
         return
 
-    gid = str(interaction.guild.id)
     out = get_output_channel(gid, interaction.channel)
 
-    # Confirm privately first, then run the full pipeline in the output channel
     await interaction.response.send_message(
         f"💰 Logged **{money(amount)}** with **{CARRIERS[carrier.value]}** ✅",
         ephemeral=True
@@ -1621,94 +2000,6 @@ async def slash_leaderboard(interaction: discord.Interaction, period: app_comman
     await slash_route_embed(interaction, leaderboard_embed(str(interaction.guild.id), p))
 
 
-# ── /fullboard — full paged leaderboard (ephemeral, does not touch /leaderboard) ──
-FULLBOARD_PAGE_SIZE = 10
-
-
-def fullboard_page_embed(guild_id, period, rows, page):
-    title_map = {
-        "today": "📅 Today's Full Leaderboard",
-        "week": "📈 Weekly Full Leaderboard",
-        "month": "👑 Monthly Full Leaderboard",
-    }
-    color_map = {"today": C_NAVY, "week": C_GOLD, "month": C_PURPLE}
-    total_pages = max(1, (len(rows) + FULLBOARD_PAGE_SIZE - 1) // FULLBOARD_PAGE_SIZE)
-    page = max(0, min(page, total_pages - 1))
-    start = page * FULLBOARD_PAGE_SIZE
-    chunk = rows[start:start + FULLBOARD_PAGE_SIZE]
-
-    embed = make_embed(title_map[period], color=color_map[period])
-    if not rows:
-        embed.description = "No AP submitted yet — be the first on the board."
-        return embed, total_pages
-
-    medals = ["🥇", "🥈", "🥉"]
-    text = ""
-    for i, row in enumerate(chunk, start=start + 1):
-        icon = medals[i - 1] if i <= 3 else f"`{i}.`"
-        text += f"{icon} **{row['username']}**: {money(row['total'])}\n"
-    embed.description = text
-    embed.add_field(name="Team Total", value=money(team_total(guild_id, period)), inline=False)
-    embed.set_footer(text=f"Page {page + 1}/{total_pages}  ·  {len(rows)} reps on the board")
-    return embed, total_pages
-
-
-class FullBoardView(discord.ui.View):
-    def __init__(self, guild_id, period, rows, author_id):
-        super().__init__(timeout=180)
-        self.guild_id = guild_id
-        self.period = period
-        self.rows = rows
-        self.author_id = author_id
-        self.page = 0
-        self._sync_buttons()
-
-    def _sync_buttons(self):
-        total_pages = max(1, (len(self.rows) + FULLBOARD_PAGE_SIZE - 1) // FULLBOARD_PAGE_SIZE)
-        self.prev_btn.disabled = self.page <= 0
-        self.next_btn.disabled = self.page >= total_pages - 1
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message("Run /fullboard yourself to page through it.", ephemeral=True)
-            return False
-        return True
-
-    async def _refresh(self, interaction: discord.Interaction):
-        self._sync_buttons()
-        embed, _ = fullboard_page_embed(self.guild_id, self.period, self.rows, self.page)
-        await interaction.response.edit_message(embed=embed, view=self)
-
-    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
-    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.page -= 1
-        await self._refresh(interaction)
-
-    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.primary)
-    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.page += 1
-        await self._refresh(interaction)
-
-
-@tree.command(name="fullboard", description="Full AP leaderboard past the top 10 — paged, only you can see it")
-@app_commands.describe(period="Which time range to show (default: this week)")
-@app_commands.choices(period=[
-    app_commands.Choice(name="Today", value="today"),
-    app_commands.Choice(name="This Week", value="week"),
-    app_commands.Choice(name="This Month", value="month"),
-])
-async def slash_fullboard(interaction: discord.Interaction, period: app_commands.Choice[str] = None):
-    if interaction.guild is None:
-        await interaction.response.send_message("Use this in a server, not DMs.", ephemeral=True)
-        return
-    p = period.value if period else "week"
-    gid = str(interaction.guild.id)
-    rows = [r for r in leaderboard(gid, p, 10000) if (r["total"] or 0) > 0]
-    embed, _ = fullboard_page_embed(gid, p, rows, 0)
-    view = FullBoardView(gid, p, rows, interaction.user.id)
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-
 @tree.command(name="levels", description="The monthly AP status tiers, Noob to God Mode")
 async def slash_levels(interaction: discord.Interaction):
     await interaction.response.send_message(embed=levels_embed(), ephemeral=True)
@@ -1740,10 +2031,196 @@ async def slash_allhours(interaction: discord.Interaction, period: app_commands.
     await slash_route_embed(interaction, embed)
 
 
+
+KPI_PERIOD_CHOICES = [
+    app_commands.Choice(name="Today", value="today"),
+    app_commands.Choice(name="This Week", value="week"),
+    app_commands.Choice(name="This Month", value="month"),
+]
+
+DM_CHOICES = [
+    app_commands.Choice(name="On", value="on"),
+    app_commands.Choice(name="Off", value="off"),
+]
+
+
+@tree.command(name="checkin", description="Submit or update today's five sales KPI numbers")
+async def slash_checkin(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Use `/checkin` inside your server.", ephemeral=True)
+        return
+    gid = str(interaction.guild.id)
+    existing = get_kpi_day(gid, interaction.user.id)
+    await interaction.response.send_modal(KPICheckinModal(gid, existing))
+
+
+@tree.command(name="dms", description="View or change your daily KPI reminder DMs")
+@app_commands.describe(setting="Turn daily KPI reminder DMs on or off")
+@app_commands.choices(setting=DM_CHOICES)
+async def slash_dms(interaction: discord.Interaction, setting: app_commands.Choice[str] = None):
+    if interaction.guild is None:
+        await interaction.response.send_message("Use this inside your server.", ephemeral=True)
+        return
+    gid = str(interaction.guild.id)
+
+    if setting is None:
+        status = "ON ✅" if dm_enabled(gid, interaction.user.id) else "OFF 🔕"
+        await interaction.response.send_message(
+            f"Your daily KPI reminder DMs are **{status}**.\nUse `/dms on` or `/dms off` to change it.",
+            ephemeral=True
+        )
+        return
+
+    enabled = setting.value == "on"
+    set_dm_enabled(gid, interaction.user.id, enabled)
+    await interaction.response.send_message(
+        "Daily KPI reminder DMs are **ON** ✅" if enabled
+        else "Daily KPI reminder DMs are **OFF** 🔕\nYou can still submit anytime with `/checkin`.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="today", description="Your AP + KPI funnel for today")
+async def slash_today(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Use this inside your server.", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=rep_kpi_embed(str(interaction.guild.id), interaction.user, "today"), ephemeral=True)
+
+
+@tree.command(name="myweek", description="Your AP + KPI funnel for this week")
+async def slash_myweek(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Use this inside your server.", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=rep_kpi_embed(str(interaction.guild.id), interaction.user, "week"), ephemeral=True)
+
+
+@tree.command(name="mymonth", description="Your AP + KPI funnel for this month")
+async def slash_mymonth(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Use this inside your server.", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=rep_kpi_embed(str(interaction.guild.id), interaction.user, "month"), ephemeral=True)
+
+
+@tree.command(name="teamkpi", description="Manager view of team activity, conversion, and AP")
+@app_commands.describe(period="Today, this week, or this month")
+@app_commands.choices(period=KPI_PERIOD_CHOICES)
+async def slash_teamkpi(interaction: discord.Interaction, period: app_commands.Choice[str] = None):
+    if interaction.guild is None:
+        await interaction.response.send_message("Use this inside your server.", ephemeral=True)
+        return
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Manager/admin only.", ephemeral=True)
+        return
+    p = period.value if period else "today"
+    await interaction.response.send_message(embed=team_kpi_embed(str(interaction.guild.id), p), ephemeral=True)
+
+
+@tree.command(name="repkpi", description="Manager view of one rep's KPI funnel")
+@app_commands.describe(rep="Rep to inspect", period="Today, this week, or this month")
+@app_commands.choices(period=KPI_PERIOD_CHOICES)
+async def slash_repkpi(interaction: discord.Interaction, rep: discord.Member, period: app_commands.Choice[str] = None):
+    if interaction.guild is None:
+        await interaction.response.send_message("Use this inside your server.", ephemeral=True)
+        return
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Manager/admin only.", ephemeral=True)
+        return
+    p = period.value if period else "today"
+    await interaction.response.send_message(embed=rep_kpi_embed(str(interaction.guild.id), rep, p), ephemeral=True)
+
+
+@tree.command(name="missingkpi", description="Manager list of reps who have not submitted today's check-in")
+async def slash_missingkpi(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Use this inside your server.", ephemeral=True)
+        return
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Manager/admin only.", ephemeral=True)
+        return
+
+    missing = kpi_missing_members(interaction.guild)
+    embed = make_embed("📋 MISSING KPI CHECK-INS", color=C_ORANGE)
+    if not missing:
+        embed.description = "Everyone in the KPI rep role has checked in today. ✅"
+    else:
+        lines = []
+        for m in missing:
+            dm_state = "DMs on" if dm_enabled(interaction.guild.id, m.id) else "DMs off"
+            lines.append(f"• <@{m.id}> · {dm_state}")
+        embed.description = "\n".join(lines[:75])
+        if len(lines) > 75:
+            embed.set_footer(text=f"{len(lines)} reps missing total")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="setupscoreboard", description="Admin: make this the AP scoreboard channel")
+async def slash_setupscoreboard(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Use this inside your server.", ephemeral=True)
+        return
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Manager/admin only.", ephemeral=True)
+        return
+
+    gid = str(interaction.guild.id)
+    await interaction.response.defer(ephemeral=True)
+    msg = await interaction.channel.send(embed=scoreboard_embed(gid))
+    set_setting(gid, "scoreboard_channel_id", interaction.channel.id)
+    set_setting(gid, "scoreboard_message_id", msg.id)
+    await interaction.followup.send(
+        f"✅ <#{interaction.channel.id}> is now the scoreboard channel. AP will only count here.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="setupoutput", description="Admin: route public CloserBot results to this channel")
+async def slash_setupoutput(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Use this inside your server.", ephemeral=True)
+        return
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Manager/admin only.", ephemeral=True)
+        return
+    set_setting(interaction.guild.id, "output_channel_id", interaction.channel.id)
+    await interaction.response.send_message(f"✅ Public CloserBot results will post in <#{interaction.channel.id}>.", ephemeral=True)
+
+
+@tree.command(name="setupannouncements", description="Admin: send scheduled recaps to this channel")
+async def slash_setupannouncements(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Use this inside your server.", ephemeral=True)
+        return
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Manager/admin only.", ephemeral=True)
+        return
+    set_setting(interaction.guild.id, "announcements_channel_id", interaction.channel.id)
+    await interaction.response.send_message(f"✅ Scheduled recaps will post in <#{interaction.channel.id}>.", ephemeral=True)
+
+
+@tree.command(name="setupkpirole", description="Admin: choose which role receives daily KPI check-in DMs")
+@app_commands.describe(role="Role whose members should receive KPI check-in reminders")
+async def slash_setupkpirole(interaction: discord.Interaction, role: discord.Role):
+    if interaction.guild is None:
+        await interaction.response.send_message("Use this inside your server.", ephemeral=True)
+        return
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("Manager/admin only.", ephemeral=True)
+        return
+    set_setting(interaction.guild.id, "kpi_role_name", role.name)
+    await interaction.response.send_message(
+        f"✅ Daily KPI reminders will target members with the **{role.name}** role.\n"
+        f"Individual reps can opt out anytime with `/dms off`.",
+        ephemeral=True
+    )
+
+
 @client.event
 async def on_ready():
     print("====================================")
-    print("        CLOSERBOT v2.0 — SCHEDULED POSTS")
+    print("        CLOSERBOT v2.1 — KPI CHECK-INS")
     print("====================================")
     print(f"✅ Logged in as {client.user}")
     print("Ready to Track Closers 🚀")
@@ -1756,6 +2233,13 @@ async def on_ready():
         except Exception as e:
             print(f"Slash sync failed for guild {guild.id}: {e}")
     print("✅ Slash commands synced")
+
+    # Register persistent KPI DM buttons so old reminder buttons keep working
+    for guild in client.guilds:
+        try:
+            client.add_view(CheckinPromptView(str(guild.id)))
+        except Exception as e:
+            print(f"KPI button registration failed for guild {guild.id}: {e}")
 
     # Pick up anyone already on the floor (cam + mic on) when the bot starts
     for guild in client.guilds:
@@ -1855,7 +2339,7 @@ async def process_line(message, raw_line, guild_id, out):
         embed = make_embed("📤 OUTPUT CHANNEL SET", color=C_GREEN)
         embed.description = (
             f"All bot responses will now post here.\n\n"
-            f"Reps can submit AP in any channel — alerts, leaderboards, and "
+            f"Reps submit AP only in the configured scoreboard channel — alerts, leaderboards, and "
             f"errors will all route to <#{message.channel.id}>. Each rep gets "
             f"a quick confirmation (amount + carrier logged) replied under "
             f"their message, which clears itself after a few seconds.\n\n"
@@ -1975,6 +2459,27 @@ async def process_line(message, raw_line, guild_id, out):
 
     if result is not None:
         status, amount, carrier_code, was_fuzzy = result
+
+        # Rep AP submissions only count in the configured scoreboard channel.
+        scoreboard_id = get_setting(guild_id, "scoreboard_channel_id")
+        if not scoreboard_id:
+            try:
+                await message.reply(
+                    "📍 AP is not being tracked yet. Ask a manager to run `/setupscoreboard` in the scoreboard channel.",
+                    delete_after=20, mention_author=False
+                )
+            except discord.HTTPException:
+                pass
+            return
+        if str(message.channel.id) != str(scoreboard_id):
+            try:
+                await message.reply(
+                    f"📍 AP only counts in <#{scoreboard_id}>. Post it there so it hits the scoreboard.",
+                    delete_after=20, mention_author=False
+                )
+            except discord.HTTPException:
+                pass
+            return
 
         if status == "error":
             err = make_embed("❌ Couldn't Parse Your Entry", color=C_RED)
@@ -2373,6 +2878,11 @@ async def process_line(message, raw_line, guild_id, out):
             inline=True
         )
         embed.add_field(
+            name="📊 KPI Management",
+            value="`/teamkpi` — team funnel\n`/repkpi @rep` — individual funnel\n`/missingkpi` — missing daily check-ins\n`/setupkpirole @role` — choose who gets nightly DMs",
+            inline=False
+        )
+        embed.add_field(
             name="🖥️ Setup",
             value="`setupscoreboard` — pin live board in this channel\n`setupoutput` — route all bot responses to this channel\n`setupannouncements` — schedule daily/weekly/EOM posts here\n`refresh` — force scoreboard refresh\n`resetalldata` — wipe all entries and stats (testing only)",
             inline=False
@@ -2529,7 +3039,7 @@ async def process_line(message, raw_line, guild_id, out):
             name="📥 Logging AP",
             value=(
                 "**Easiest:** `/ap` — type your amount, pick the carrier from a menu.\n\n"
-                "Or just type it — `ap` plus amount and carrier, in any order, "
+                "Or just type it in the scoreboard channel — `ap` plus amount and carrier, in any order, "
                 "with or without `$`. Extra notes are ignored automatically.\n"
                 "`ap 1209 americo`\n"
                 "`ap $1,236 uhl GI 24 mos`\n"
@@ -2549,7 +3059,7 @@ async def process_line(message, raw_line, guild_id, out):
         )
         embed.add_field(
             name="🏆 Leaderboards",
-            value="`/leaderboard` — top 10, pick today · week · month\nor type `daily`  ·  `weekly`  ·  `monthly`\n`/fullboard` — everyone past the top 10, paged (only you see it)",
+            value="`/leaderboard` — pick today · week · month\nor type `daily`  ·  `weekly`  ·  `monthly`",
             inline=False
         )
         embed.add_field(
@@ -2559,6 +3069,15 @@ async def process_line(message, raw_line, guild_id, out):
                 "`/hours` — your hours today / week / month\n"
                 "`/allhours` — everyone's hours, pick day · week · month\n"
                 "Typing `hours` or `allhours` works too."
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name="📊 Daily KPI Check-In",
+            value=(
+                "`/checkin` — dials · pickups · appointments · presentations · closes\n"
+                "`/today` · `/myweek` · `/mymonth` — your full funnel + AP\n"
+                "`/dms off` — opt out of nightly KPI reminder DMs"
             ),
             inline=False
         )
@@ -2632,6 +3151,11 @@ async def on_member_join(member):
         f"**camera ON and mic ON**. Mute or kill the cam and the clock pauses.\n"
         f"`/hours` — your time today, this week, this month\n"
         f"`/allhours` — the whole team\'s hours\n\n"
+        f"**📊 Daily KPI check-in:**\n"
+        f"At 7:00 PM Central on weekdays, CloserBot can DM you a 5-number check-in: "
+        f"dials, pickups, appointments, presentations, and closes.\n"
+        f"`/checkin` — submit anytime  ·  `/dms off` — opt out of reminder DMs\n"
+        f"`/today` `/myweek` `/mymonth` — see your full funnel + AP\n\n"
         f"**📊 Boards & recaps:**\n"
         f"`stats` — your totals + rank  ·  `levels` — status tiers\n"
         f"`daily` `weekly` `monthly` — AP leaderboards\n"
