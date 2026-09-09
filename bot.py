@@ -756,9 +756,57 @@ def get_all_guild_ids():
 # ── KPI check-in + Fast Start accountability ──────────────────────────────────
 
 DEFAULT_KPI_ROLE = "Fast Start"
+FAST_START_ROLE = "Fast Start"
+FAST_START_EMOJI = "🚀"
 CONTACT_TARGET = 0.25
 SHOW_TARGET = 0.40
 CLOSE_TARGET = 0.25
+
+
+def has_fast_start_role(member):
+    """True when the member currently has the Fast Start role."""
+    return any(role.name.lower() == FAST_START_ROLE.lower() for role in member.roles)
+
+
+def strip_fast_start_emoji(name):
+    """Remove one or more Fast Start rocket prefixes without touching the rest of the nickname."""
+    if not name:
+        return name
+    return re.sub(r"^(?:🚀\s*)+", "", name).strip()
+
+
+async def sync_fast_start_nickname(member):
+    """Keep the 🚀 nickname prefix in sync with the Fast Start role."""
+    if member.bot:
+        return
+
+    has_role = has_fast_start_role(member)
+    current_name = member.nick or member.display_name
+
+    try:
+        if has_role:
+            clean_name = strip_fast_start_emoji(current_name)
+            desired_name = f"{FAST_START_EMOJI} {clean_name}"
+            if member.nick != desired_name:
+                await member.edit(
+                    nick=desired_name,
+                    reason="Fast Start role added: add rocket nickname badge",
+                )
+                print(f"🚀 Added Fast Start nickname badge to {member}")
+        elif member.nick and member.nick.startswith(FAST_START_EMOJI):
+            clean_name = strip_fast_start_emoji(member.nick)
+            await member.edit(
+                nick=clean_name or None,
+                reason="Fast Start role removed: remove rocket nickname badge",
+            )
+            print(f"Removed Fast Start nickname badge from {member}")
+    except discord.Forbidden:
+        print(
+            f"Cannot update nickname for {member}. "
+            "Give the bot Manage Nicknames and place its role above the member's highest role."
+        )
+    except discord.HTTPException as e:
+        print(f"Nickname update failed for {member}: {e}")
 
 
 def kpi_day():
@@ -2478,6 +2526,13 @@ async def on_ready():
                 if not m.bot and hours_qualifies(m.voice):
                     hours_start(guild.id, m.id, m.display_name)
 
+    # Apply the 🚀 immediately to anyone who already has Fast Start when the bot boots.
+    # This also makes deployment work without removing/re-adding the role first.
+    for guild in client.guilds:
+        for member in guild.members:
+            if has_fast_start_role(member):
+                await sync_fast_start_nickname(member)
+
     if not scheduler.is_running():
         scheduler.start()
 
@@ -2493,6 +2548,19 @@ async def on_voice_state_update(member, before, after):
         hours_start(member.guild.id, member.id, member.display_name)
     elif was and not now:
         hours_stop(member.guild.id, member.id)
+
+
+@client.event
+async def on_member_update(before, after):
+    """Add 🚀 when Fast Start is assigned and remove it when Fast Start is removed."""
+    if after.bot:
+        return
+
+    had_fast_start = has_fast_start_role(before)
+    has_fast_start = has_fast_start_role(after)
+
+    if had_fast_start != has_fast_start:
+        await sync_fast_start_nickname(after)
 
 
 async def process_line(message, raw_line, guild_id, out):
